@@ -1,81 +1,42 @@
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score
-import joblib
+"""Train an exoplanet random forest from the command line."""
 
-CSV_PATH = r'c:\Users\Dell\OneDrive\Desktop\ml\project nasa\planets.csv'
+import argparse
+from pathlib import Path
 
-try:
-    df = pd.read_csv(CSV_PATH, nrows=2000)
-except Exception as e:
-    print('Failed to read sample from CSV:', e)
-    raise
+from exoplanet import MAX_ROWS, default_features, feature_columns, model_bytes, read_csv, train
 
-print('Read sample shape:', df.shape)
-print(df.columns[:20])
-df = df.dropna(axis=1, how='all')
-for c in df.select_dtypes(include=[np.number]).columns:
-    df[c] = pd.to_numeric(df[c], errors='coerce')
-    if df[c].isnull().any():
-        df[c].fillna(df[c].median(), inplace=True)
-for c in df.select_dtypes(include=['object']).columns:
-    df[c] = df[c].fillna('Unknown')
 
-sel = [c for c in ['pl_orbper','sy_jmag','sy_hmag','sy_kmag','disc_year'] if c in df.columns]
-print('Selected features:', sel)
-if not sel:
-    sel = list(df.select_dtypes(include=[np.number]).columns[:5])
-    print('Fallback numeric features:', sel)
-
-if 'pl_bmassj' in df.columns:
-    tar = 'pl_bmassj'
-    is_regression = True
-else:
-    tar = None
-    for c in df.select_dtypes(include=[np.number]).columns:
-        if df[c].nunique() <= 10:
-            tar = c
-            is_regression = False
-            break
-    if tar is None:
-        print('No suitable target found in sample. Exiting.')
-        raise SystemExit(1)
-
-print('Target:', tar, 'regression?', is_regression)
-
-X = df[sel]
-y = df[tar]
-
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-if is_regression:
-    model = RandomForestRegressor(n_estimators=50, random_state=42)
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    print('MSE:', mean_squared_error(y_test, y_pred))
-    print('MAE:', mean_absolute_error(y_test, y_pred))
-    print('R2:', r2_score(y_test, y_pred))
-    out_path = r'c:\Users\Dell\OneDrive\Desktop\ml\project nasa\\rf_sample_model.joblib'
-    joblib.dump(model, out_path)
-    print('Saved trained model to', out_path)
-else:
-    model = RandomForestClassifier(n_estimators=50, random_state=42)
-    if y_train.dtype == 'O' or y_train.dtype.name == 'category':
-        y_train = pd.factorize(y_train)[0]
-        y_test = pd.factorize(y_test)[0]
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("csv", type=Path, help="Path to your catalog")
+    parser.add_argument("--target", default="pl_bmassj")
+    parser.add_argument("--task", choices=["regression", "classification"], default="regression")
+    parser.add_argument("--features", nargs="+", help="Numeric input columns; omit to use defaults")
+    parser.add_argument("--output", type=Path, default=Path("exoplanet_model.joblib"))
+    parser.add_argument("--rows", type=int, default=MAX_ROWS)
+    args = parser.parse_args()
+    if not 1 <= args.rows <= MAX_ROWS:
+        parser.error(f"--rows must be between 1 and {MAX_ROWS:,}")
     try:
-        unq, cnt = np.unique(y_train, return_counts=True)
-        for u, c in zip(unq, cnt):
-            print(f"Class {u} contains {c} samples")
-    except Exception as e:
-        print('Could not compute class counts:', e)
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    print('Accuracy:', accuracy_score(y_test, y_pred))
-    out_path = r'c:\Users\Dell\OneDrive\Desktop\ml\project nasa\\rf_sample_model.joblib'
-    joblib.dump(model, out_path)
-    print('Saved trained model to', out_path)
+        frame, truncated = read_csv(args.csv, args.rows)
+        features = args.features or default_features(feature_columns(frame, args.target))
+        artifact, report = train(frame, features, args.target, args.task)
+        payload = model_bytes(artifact)
+        with args.output.open("xb") as output:
+            output.write(payload)
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"Error: {exc}\n")
 
-print('Done')
+    if truncated:
+        print(f"Used the first {len(frame):,} rows.")
+    print(f"Target: {args.target} | Features: {', '.join(features)}")
+    print(f"Train: {report['train_rows']:,} | Test: {report['test_rows']:,} | "
+          f"Unusable targets: {report['unlabeled_rows']:,} | Duplicates: {report['duplicate_rows']:,}")
+    for key, value in report["metrics"].items():
+        key = "R2" if key == "R²" else key
+        print(f"{key}: {value:.4f}" if value is not None else f"{key}: unavailable")
+    print(f"Saved {args.output}")
+
+
+if __name__ == "__main__":
+    main()

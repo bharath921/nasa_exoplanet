@@ -1,3 +1,2 @@
 [server]
-# maxUploadSize is in MB
-maxUploadSize = 300
+maxUploadSize = 25

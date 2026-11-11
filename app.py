@@ -1,181 +1,125 @@
-import streamlit as st
+from hashlib import sha256
+
 import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import accuracy_score, classification_report, r2_score, mean_squared_error
-import joblib
-import tempfile
+import streamlit as st
 
-st.set_page_config(page_title='Simple RF Trainer', layout='wide')
-st.title('Simple Random Forest Trainer')
+from exoplanet import (
+    MAX_ROWS, default_features, demo_data, feature_columns, model_bytes, predict,
+    read_csv, train,
+)
 
+st.set_page_config(page_title="Exoplanet Model Lab", page_icon="🪐", layout="wide")
+st.title("🪐 Exoplanet Model Lab")
+st.write("Explore a dataset, train a random forest, and compare its predictions with a simple baseline.")
 
-def train_model_and_predict(df, features, target, n_estimators=100, random_state=42):
-    
-    data = df.copy()
-    for c in ['hd_name', 'hip_name', 'tic_id', 'gaia_id']:
-        if c in data.columns:
-            try:
-                data.drop(columns=c, inplace=True)
-            except Exception:
-                pass
+source = st.radio("Dataset", ["Synthetic demo", "Upload CSV"], horizontal=True)
+if source == "Synthetic demo":
+    st.info("The demo uses simulated values. Its scores do not describe real exoplanets.")
+    dataset_id, frame, truncated = "demo", demo_data(), False
+else:
+    uploaded = st.file_uploader("Exoplanet catalog or labeled dataset", type="csv")
+    if uploaded is None:
+        st.stop()
+    dataset_id = sha256(uploaded.getbuffer()).hexdigest()
+    try:
+        if st.session_state.get("csv_id") != dataset_id:
+            st.session_state.csv_data = read_csv(uploaded)
+            st.session_state.csv_id = dataset_id
+        frame, truncated = st.session_state.csv_data
+    except (ValueError, pd.errors.ParserError) as exc:
+        st.error(f"Could not read the CSV: {exc}")
+        st.stop()
 
-    features = [f for f in features if f in data.columns]
-    if not features:
-        raise ValueError('No valid feature columns provided')
+if truncated:
+    st.warning(f"Using the first {MAX_ROWS:,} rows. If the catalog is sorted, upload a representative sample.")
 
-    X = data[features].copy()
-    for col in X.columns:
-        X[col] = pd.to_numeric(X[col], errors='coerce')
-    
-    X = X.fillna(X.median())
+with st.expander(f"Dataset preview · {len(frame):,} rows × {len(frame.columns)} columns", expanded=True):
+    st.dataframe(frame.head(10), hide_index=True, width="stretch")
 
-    y = None
-    if target in data.columns:
-        y = data[target].copy()
+st.header("Train a model")
+target = st.selectbox(
+    "Target column", frame.columns.tolist(),
+    index=frame.columns.get_loc("pl_bmassj") if "pl_bmassj" in frame else None,
+    key=f"target-{dataset_id}",
+)
+if target is None:
+    st.info("Choose the column you want to predict.")
+    st.stop()
+available = feature_columns(frame, target)
+if not available:
+    st.warning("This target has no eligible numeric input columns.")
+    st.stop()
+st.caption("Use features you would actually know at prediction time. Exclude any value derived from the target.")
+with st.form("train", clear_on_submit=False):
+    features = st.multiselect(
+        "Input features", available, default=default_features(available),
+        key=f"features-{dataset_id}-{target}",
+    )
+    left, middle, right = st.columns(3)
+    task = left.selectbox("Task", ["Regression", "Classification"],
+                          index=int(target == "orbit_group"), key=f"task-{dataset_id}-{target}")
+    trees = middle.slider("Trees", 25, 200, 100, step=25)
+    test_percent = right.slider("Holdout size (%)", 15, 40, 25, step=5)
+    submitted = st.form_submit_button("Train and evaluate", type="primary")
 
-    is_classification = False
-    labels = None
-    if y is None:
-       
-        indicator_cols = [c for c in ['pl_name','pl_bmassj','pl_orbper','pl_rade','pl_radj'] if c in data.columns]
-        if not indicator_cols:
-            raise ValueError('No target provided and no indicator columns available to build is_planet label')
-        y = data[indicator_cols].notnull().any(axis=1).astype(int)
-        is_classification = True
+if submitted:
+    st.session_state.pop("training_result", None)
+    try:
+        with st.spinner("Fitting and evaluating the random forest…"):
+            artifact, report = train(
+                frame, features, target, task.lower(), n_estimators=trees,
+                test_size=test_percent / 100,
+            )
+            st.session_state.training_result = (dataset_id, artifact, report, model_bytes(artifact))
+    except ValueError as exc:
+        st.error(str(exc))
+
+result = st.session_state.get("training_result")
+if not result or result[0] != dataset_id or result[1]["target"] != target:
+    st.stop()
+
+_, artifact, report, download = result
+st.header("Holdout results")
+st.caption(
+    f"{artifact['task'].title()} for {target} · {report['train_rows']:,} training rows · "
+    f"{report['test_rows']:,} test rows · {report['unlabeled_rows']:,} unusable targets · "
+    f"{report['duplicate_rows']:,} duplicate examples removed"
+)
+for column, (name, value) in zip(st.columns(len(report["metrics"])), report["metrics"].items()):
+    column.metric(name, "Unavailable" if value is None else f"{value:.3f}")
+
+diagnostics, importance = st.tabs(["Model diagnostics", "Feature importance"])
+with diagnostics:
+    if artifact["task"] == "classification":
+        st.write("Confusion matrix (rows: actual; columns: predicted)")
+        st.dataframe(report["details"]["confusion"])
+        with st.expander("Per-class scores"):
+            st.dataframe(report["details"]["report"])
     else:
-        try:
-            y = pd.to_numeric(y, errors='coerce')
-            if y.isnull().all():
-                y = data[target].astype('object')
-                is_classification = True
-            else:
-                y = y.fillna(y.median())
-                is_classification = False
-        except Exception:
-            is_classification = True
+        st.write("Actual vs. predicted")
+        st.scatter_chart(report["details"]["predictions"], x="Actual", y="Predicted")
+with importance:
+    st.caption("Random forest importance measures how the model uses each input.")
+    st.bar_chart(report["importance"].rename("Importance"), horizontal=True)
 
-    if is_classification:
-        if y.dtype == 'O' or y.dtype.name == 'category':
-            labels, y_enc = np.unique(y, return_inverse=True)
-            y_used = pd.Series(y_enc, index=y.index)
+st.download_button(
+    "Download trained pipeline", download, "exoplanet_model.joblib",
+    mime="application/octet-stream",
+)
+
+st.header("Try a prediction")
+st.caption("Inputs start at their training-set medians. Use the same units as your dataset.")
+with st.form("predict"):
+    inputs = {
+        col: st.number_input(col, value=artifact["defaults"][col], format="%.6g",
+                             key=f"predict-{dataset_id}-{target}-{col}-{artifact['defaults'][col]}")
+        for col in artifact["features"]
+    }
+    if st.form_submit_button("Predict"):
+        try:
+            value = predict(artifact, pd.DataFrame([inputs]))[0]
+        except ValueError:
+            st.error("Could not predict from these values. Check the input ranges and units.")
         else:
-            labels = None
-            y_used = y
-    else:
-        y_used = y
-
-    stratify_arg = y_used if (hasattr(y_used, 'value_counts') and getattr(y_used, 'value_counts')().min() >= 2 if is_classification else False) else None
-    if stratify_arg is None and is_classification:
-        st.warning('Some classes have <2 samples; proceeding without stratify')
-
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(X, y_used, test_size=0.2, random_state=random_state, stratify=stratify_arg)
-    except Exception:
-        X_train, X_test, y_train, y_test = train_test_split(X, y_used, test_size=0.2, random_state=random_state)
-
-    if is_classification:
-        model = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state)
-    else:
-        model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_state)
-
-    model.fit(X_train, y_train)
-
-    preds = model.predict(X_test)
-    out = {'model': model, 'is_classification': is_classification, 'labels': labels, 'features': features}
-    if is_classification:
-        st.write('Accuracy:', round(accuracy_score(y_test, preds), 4))
-        st.text('Classification report:')
-        st.text(classification_report(y_test, preds))
-    else:
-        mse = mean_squared_error(y_test, preds)
-        st.write('R2:', round(r2_score(y_test, preds), 4))
-        st.write('RMSE:', round(np.sqrt(mse), 4))
-
-    return out
-
-
-uploaded_file = st.file_uploader('Upload CSV (cleaned preferred)', type=['csv'])
-model_artifact = None
-if uploaded_file is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp:
-        tmp.write(uploaded_file.read())
-        path = tmp.name
-
-    try:
-        df = pd.read_csv(path, low_memory=True)
-    except Exception:
-        st.warning('Full read failed — reading a small sample instead')
-        df = pd.read_csv(path, nrows=2000)
-
-    st.write('Loaded dataset shape:', df.shape)
-    st.dataframe(df.head())
-
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    st.sidebar.markdown('Select features and target')
-    features = st.sidebar.multiselect('Features (numeric only recommended)', numeric_cols, default=numeric_cols[:5])
-    target = st.sidebar.selectbox('Target column (leave blank to build is_planet)', [''] + df.columns.tolist())
-
-    if st.sidebar.button('Train Random Forest'):
-        try:
-            chosen_target = target if target != '' else None
-            res = train_model_and_predict(df, features, chosen_target, n_estimators=100)
-            model_artifact = res
-            model_path = 'rf_model.joblib'
-            to_dump = {'model': res['model'], 'is_classification': res['is_classification'], 'labels': res['labels'], 'features': res['features']}
-            joblib.dump(to_dump, model_path)
-            st.success(f'Model + metadata saved to {model_path}')
-            with open(model_path, 'rb') as f:
-                st.download_button('Download model artifact', f, file_name=model_path)
-        except Exception as e:
-            st.error('Training failed: ' + str(e))
-
-    if st.sidebar.button('Load saved model'):
-        try:
-            loaded = joblib.load('rf_model.joblib')
-            model_artifact = loaded
-            st.success('Loaded rf_model.joblib')
-        except Exception as e:
-            st.warning('Could not load rf_model.joblib: ' + str(e))
-
-    st.markdown('---')
-    st.subheader('Predict on a single example')
-    if 'model' in (model_artifact or {}):
-        ma = model_artifact
-    else:
-        try:
-            ma = joblib.load('rf_model.joblib')
-        except Exception:
-            ma = None
-
-    if ma is None:
-        st.info('No trained model available yet. Train a model or load rf_model.joblib to enable single-row prediction.')
-    else:
-        feat_list = ma['features']
-        inputs = {}
-        cols = st.columns(len(feat_list)) if len(feat_list) <= 6 else None
-        for i, f in enumerate(feat_list):
-            if cols:
-                inputs[f] = cols[i].number_input(f, value=float(df[f].median()) if f in df.columns else 0.0)
-            else:
-                inputs[f] = st.number_input(f, value=float(df[f].median()) if f in df.columns else 0.0)
-
-        if st.button('Predict single row'):
-            row = pd.DataFrame([inputs])
-            for c in row.columns:
-                row[c] = pd.to_numeric(row[c], errors='coerce')
-            row = row.fillna(row.median())
-            model = ma['model']
-            is_clf = ma.get('is_classification', False)
-            labels = ma.get('labels', None)
-            pred = model.predict(row[ma['features']])
-            if is_clf and labels is not None:
-                try:
-                    mapped = [labels[int(p)] for p in pred]
-                    st.write('Predicted class:', mapped[0])
-                except Exception:
-                    st.write('Predicted numeric label:', pred[0])
-            else:
-                st.write('Predicted value:', float(pred[0]))
-
+            display = value if artifact["task"] == "classification" else format(value, ".6g")
+            st.success(f"Predicted {artifact['target']}: {display}")
