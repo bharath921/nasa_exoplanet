@@ -1,19 +1,26 @@
 from hashlib import sha256
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from exoplanet import (
-    MAX_ROWS, default_features, demo_data, feature_columns, model_bytes, predict,
-    read_csv, train,
+    KEPLER_FEATURES, KEPLER_TARGET, MAX_ROWS, default_features, demo_data, feature_columns, model_bytes, predict,
+    read_csv, similar_kepler_signals, train,
 )
 
 st.set_page_config(page_title="Exoplanet Model Lab", page_icon="🪐", layout="wide")
 st.title("🪐 Exoplanet Model Lab")
-st.write("Explore a dataset, train a random forest, and compare its predictions with a simple baseline.")
+st.write("Train a model on a dataset and compare its predictions with a simple baseline.")
 
-source = st.radio("Dataset", ["Synthetic demo", "Upload CSV"], horizontal=True)
-if source == "Synthetic demo":
+source = st.radio("Dataset", ["Synthetic demo", "Kepler transit vetting", "Upload CSV"], horizontal=True)
+kepler = source == "Kepler transit vetting"
+if kepler:
+    st.info("Classify previously flagged Kepler transit signals as confirmed planets or false positives.")
+    st.caption("Source: NASA Exoplanet Archive. Compare six classifiers with five-fold cross-validation grouped by star.")
+    dataset_id = "kepler"
+    frame, truncated = read_csv(Path(__file__).parent / "data" / "kepler_koi.csv")
+elif source == "Synthetic demo":
     st.info("The demo uses simulated values. Its scores do not describe real exoplanets.")
     dataset_id, frame, truncated = "demo", demo_data(), False
 else:
@@ -37,7 +44,7 @@ with st.expander(f"Dataset preview · {len(frame):,} rows × {len(frame.columns)
     st.dataframe(frame.head(10), hide_index=True, width="stretch")
 
 st.header("Train a model")
-target = st.selectbox(
+target = KEPLER_TARGET if kepler else st.selectbox(
     "Target column", frame.columns.tolist(),
     index=frame.columns.get_loc("pl_bmassj") if "pl_bmassj" in frame else None,
     key=f"target-{dataset_id}",
@@ -45,30 +52,32 @@ target = st.selectbox(
 if target is None:
     st.info("Choose the column you want to predict.")
     st.stop()
-available = feature_columns(frame, target)
+available = KEPLER_FEATURES if kepler else feature_columns(frame, target)
 if not available:
     st.warning("This target has no eligible numeric input columns.")
     st.stop()
 st.caption("Use features you would actually know at prediction time. Exclude any value derived from the target.")
 with st.form("train", clear_on_submit=False):
     features = st.multiselect(
-        "Input features", available, default=default_features(available),
-        key=f"features-{dataset_id}-{target}",
+        "Input features", available, default=KEPLER_FEATURES if kepler else default_features(available),
+        key=f"features-{dataset_id}-{target}", disabled=kepler,
     )
     left, middle, right = st.columns(3)
     task = left.selectbox("Task", ["Regression", "Classification"],
-                          index=int(target == "orbit_group"), key=f"task-{dataset_id}-{target}")
-    trees = middle.slider("Trees", 25, 200, 100, step=25)
-    test_percent = right.slider("Holdout size (%)", 15, 40, 25, step=5)
+                          index=int(kepler or target == "orbit_group"), key=f"task-{dataset_id}-{target}",
+                          disabled=kepler)
+    trees = middle.slider("Random Forest trees" if kepler else "Trees", 25, 200, 100, step=25)
+    test_percent = right.slider("Holdout stars (%)" if kepler else "Holdout rows (%)", 15, 40, 25, step=5)
     submitted = st.form_submit_button("Train and evaluate", type="primary")
 
 if submitted:
     st.session_state.pop("training_result", None)
     try:
-        with st.spinner("Fitting and evaluating the random forest…"):
+        with st.spinner("Comparing classifiers across five folds…" if kepler else "Fitting and evaluating the random forest…"):
             artifact, report = train(
                 frame, features, target, task.lower(), n_estimators=trees,
-                test_size=test_percent / 100,
+                test_size=test_percent / 100, group_column="kepid" if kepler else None,
+                compare_models=kepler,
             )
             st.session_state.training_result = (dataset_id, artifact, report, model_bytes(artifact))
     except ValueError as exc:
@@ -79,16 +88,27 @@ if not result or result[0] != dataset_id or result[1]["target"] != target:
     st.stop()
 
 _, artifact, report, download = result
+if kepler:
+    st.header("Cross-validation results")
+    st.caption("The highest mean balanced accuracy across five training folds selects the model. Test stars are excluded from every fold.")
+    cv_scores = report["cross_validation"]
+    st.dataframe(cv_scores.style.format("{:.2%}", subset=cv_scores.columns[1:]),
+                 hide_index=True, width="stretch")
 st.header("Holdout results")
+if kepler:
+    st.caption(f"{report['train_groups']:,} training stars · {report['test_groups']:,} test stars")
 st.caption(
-    f"{artifact['task'].title()} for {target} · {report['train_rows']:,} training rows · "
+    f"{artifact['model_name']} · {artifact['task'].title()} for {target} · {report['train_rows']:,} training rows · "
     f"{report['test_rows']:,} test rows · {report['unlabeled_rows']:,} unusable targets · "
     f"{report['duplicate_rows']:,} duplicate examples removed"
 )
 for column, (name, value) in zip(st.columns(len(report["metrics"])), report["metrics"].items()):
     column.metric(name, "Unavailable" if value is None else f"{value:.3f}")
 
-diagnostics, importance = st.tabs(["Model diagnostics", "Feature importance"])
+tabs = ["Model diagnostics"]
+if report["importance"] is not None:
+    tabs.append("Feature importance")
+diagnostics, *importance = st.tabs(tabs)
 with diagnostics:
     if artifact["task"] == "classification":
         st.write("Confusion matrix (rows: actual; columns: predicted)")
@@ -98,9 +118,10 @@ with diagnostics:
     else:
         st.write("Actual vs. predicted")
         st.scatter_chart(report["details"]["predictions"], x="Actual", y="Predicted")
-with importance:
-    st.caption("Random forest importance measures how the model uses each input.")
-    st.bar_chart(report["importance"].rename("Importance"), horizontal=True)
+if importance:
+    with importance[0]:
+        st.caption("Tree feature importance measures how the fitted model uses each input.")
+        st.bar_chart(report["importance"].rename("Importance"), horizontal=True)
 
 st.download_button(
     "Download trained pipeline", download, "exoplanet_model.joblib",
@@ -115,11 +136,35 @@ with st.form("predict"):
                              key=f"predict-{dataset_id}-{target}-{col}-{artifact['defaults'][col]}")
         for col in artifact["features"]
     }
-    if st.form_submit_button("Predict"):
-        try:
-            value = predict(artifact, pd.DataFrame([inputs]))[0]
-        except ValueError:
-            st.error("Could not predict from these values. Check the input ranges and units.")
-        else:
-            display = value if artifact["task"] == "classification" else format(value, ".6g")
-            st.success(f"Predicted {artifact['target']}: {display}")
+    predict_clicked = st.form_submit_button("Predict")
+
+if predict_clicked:
+    if kepler and any(value <= 0 for value in inputs.values()):
+        st.error("Enter a positive value for each transit measurement.")
+        st.stop()
+    try:
+        value = predict(artifact, pd.DataFrame([inputs]))[0]
+    except ValueError:
+        st.error("Could not predict from these values. Check the input ranges and units.")
+    else:
+        display = value if artifact["task"] == "classification" else format(value, ".6g")
+        st.success(f"Predicted {artifact['target']}: {display}")
+        if kepler:
+            st.subheader("Similar Kepler signals")
+            st.caption("Closest catalog examples from the training stars, based on all four measurements. The labels shown are from the catalog.")
+            measurements = {
+                "koi_period": "Period (days)", "koi_duration": "Duration (hours)",
+                "koi_depth": "Depth (ppm)", "koi_model_snr": "Signal-to-noise",
+            }
+            neighbors = similar_kepler_signals(frame.loc[report["training_index"]], inputs)
+            if neighbors.empty:
+                st.info("No comparable signals are available.")
+            else:
+                query = pd.DataFrame([{"kepoi_name": "Your signal", KEPLER_TARGET: "Unknown", **inputs}])
+                comparison = pd.concat([query, neighbors], ignore_index=True)
+                st.dataframe(
+                    comparison.rename(columns={
+                        "kepoi_name": "Signal", KEPLER_TARGET: "Catalog label", **measurements
+                    }),
+                    hide_index=True, width="stretch",
+                )
